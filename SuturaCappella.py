@@ -1,8 +1,3 @@
-# DETX Rhythmo Generator V4 Optimized
-# Requirements:
-# pip install customtkinter tkinterdnd2 pillow opencv-python numpy
-# Ensure ffmpeg is installed: https://ffmpeg.org/download.html
-
 import os, time, threading, tempfile, xml.etree.ElementTree as ET, subprocess
 import cv2, numpy as np
 import customtkinter as ctk
