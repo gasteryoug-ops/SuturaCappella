@@ -7,7 +7,10 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 
 DETX_FPS = 25
 TRACKS = 4
-PPS = 350
+PPS = 200  # Pixels par seconde pour la bande rythmo
+
+# Couleur en RGB du background de la bande rythmo
+COLOR = (184,245,180,255)
 
 # Framerate et résolution options
 FRAMERATES = [24, 30, 60, 120]
@@ -135,8 +138,8 @@ def stretch_text(draw_img, text, x_pos, width_px, color, y):
     draw_img.alpha_composite(text_img,(x_pos,y))
 
 def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps):
-    # Background modifiable selon ce que vous voulez en utilisant les canals R,G,B,A (J'ai pas testé si l'alpha fait quelque chose mdr)
-    img = Image.new("RGBA",(export_w, rhythmo_h),(245,235,180,255))
+    # Background modifiable dans la variable "COLOR"
+    img = Image.new("RGBA",(export_w, rhythmo_h),(COLOR))
     d = ImageDraw.Draw(img)
 
     th = rhythmo_h // tracks
