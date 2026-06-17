@@ -5,13 +5,6 @@ from PIL import Image, ImageDraw, ImageFont
 from tkinter import filedialog
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
-try:
-    import torch
-    import torch.nn.functional as F
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
 DETX_FPS = 25
 TRACKS = 4
 PPS = 350
@@ -101,30 +94,12 @@ def hex2rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2],16) for i in (0,2,4))
 
-def fit_frame(frame, export_w, export_h, use_gpu=False):
+def fit_frame(frame, export_w, export_h):
     h, w = frame.shape[:2]
     scale = min(export_w/w, export_h/h)
     nw, nh = int(w*scale), int(h*scale)
 
-    if use_gpu and TORCH_AVAILABLE:
-        try:
-            # Utiliser PyTorch/CUDA pour redimensionner avec optimisations
-            frame_tensor = torch.from_numpy(frame).float().permute(2, 0, 1).unsqueeze(0)
-            frame_tensor = frame_tensor.to('cuda', non_blocking=True)
-            
-            # Interpolation bilinéaire (plus rapide que bicubic)
-            resized_tensor = F.interpolate(
-                frame_tensor, 
-                size=(nh, nw), 
-                mode='bilinear', 
-                align_corners=False
-            )
-            resized = resized_tensor.squeeze(0).permute(1, 2, 0).cpu(non_blocking=True).numpy().astype(np.uint8)
-        except Exception as e:
-            print(f"GPU resize failed, falling back to CPU: {e}")
-            resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    else:
-        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
     canvas = np.zeros((export_h, export_w, 3), dtype=np.uint8)
 
@@ -217,7 +192,6 @@ class App:
         self.selected_fps = ctk.IntVar(value=60)
         self.selected_resolution = ctk.StringVar(value="1080p")
         self.mute_audio = ctk.BooleanVar(value=False)
-        self.use_gpu = ctk.StringVar(value="CPU")
 
         # Main frame
         main_frame = ctk.CTkFrame(self.root)
@@ -318,25 +292,6 @@ class App:
             variable=self.mute_audio
         )
         self.mute_checkbox.pack(anchor="w")
-
-        # GPU/CPU selector
-        gpu_frame = ctk.CTkFrame(main_frame)
-        gpu_frame.pack(fill="x", pady=15)
-
-        gpu_label = ctk.CTkLabel(gpu_frame, text="Rendu:", font=("Arial", 12, "bold"))
-        gpu_label.pack(side="left", padx=(0,10))
-
-        gpu_options = ["CPU"]
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            gpu_options.append("GPU (CUDA)")
-
-        self.gpu_dropdown = ctk.CTkComboBox(
-            gpu_frame,
-            values=gpu_options,
-            variable=self.use_gpu,
-            state="readonly"
-        )
-        self.gpu_dropdown.pack(side="left", padx=5)
 
         # Framerate
         framerate_frame = ctk.CTkFrame(main_frame)
@@ -446,7 +401,6 @@ class App:
             fps = self.selected_fps.get()
             res_key = self.selected_resolution.get()
             export_w, export_h = RESOLUTIONS[res_key]
-            use_gpu = self.use_gpu.get() == "GPU (CUDA)"
             
             rhythmo_h = int(export_h * 0.25)  # 25% pour la bande rythmo
             video_h = export_h - rhythmo_h
@@ -469,14 +423,6 @@ class App:
             )
 
             start = time.time()
-
-            # Batch processing - augmenter si GPU
-            if use_gpu and TORCH_AVAILABLE:
-                batch_size = 16  # Batch plus grand pour GPU
-                torch.cuda.empty_cache()  # Libérer mémoire GPU au démarrage
-                torch.backends.cudnn.benchmark = True  # Auto-optimize convolutions
-            else:
-                batch_size = 1
             
             frame_queue = []
             
@@ -488,35 +434,27 @@ class App:
                 if not ok:
                     break
                 
-                frame = fit_frame(frame, export_w, video_h, use_gpu)
-                frame_queue.append((frame, t, i))
+                frame = fit_frame(frame, export_w, video_h)
+                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS)
 
-                # Traiter le batch ou si c'est le dernier
-                if len(frame_queue) >= batch_size or i == total - 1:
-                    # Traiter tous les frames du batch
-                    for buffered_frame, buffered_t, frame_idx in frame_queue:
-                        rh = make_rhythmo(segments, buffered_t, export_w, export_h, rhythmo_h, TRACKS, PPS)
+                final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
+                final[:video_h] = frame
+                final[video_h:] = rh
 
-                        final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
-                        final[:video_h] = buffered_frame
-                        final[video_h:] = rh
+                writer.write(final)
 
-                        writer.write(final)
+                prog = (i+1)/total
+                self.progress.set(prog)
 
-                        prog = (frame_idx+1)/total
-                        self.progress.set(prog)
+                elapsed = time.time()-start
+                fps_actual = (i+1)/max(elapsed, 0.01)
+                eta = (total-(i+1))/max(fps_actual, 0.01)
 
-                        elapsed = time.time()-start
-                        fps_actual = (frame_idx+1)/max(elapsed, 0.01)
-                        eta = (total-(frame_idx+1))/max(fps_actual, 0.01)
-
-                        self.status.configure(
-                            text=f"{frame_idx+1:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
-                            text_color="#ffffff"
-                        )
-                        self.root.update()
-                    
-                    frame_queue = []
+                self.status.configure(
+                    text=f"{i+1:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
+                    text_color="#ffffff"
+                )
+                self.root.update()
 
             writer.release()
             cap.release()
