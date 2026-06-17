@@ -9,7 +9,7 @@ echo =====================================
 echo.
 
 :: Vérifier Python
-echo [1/3] Vérification de Python...
+echo [1/4] Vérification de Python...
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo ❌ Python non trouvé!
@@ -24,7 +24,7 @@ echo ✓ Python trouvé
 
 :: Vérifier ffmpeg
 echo.
-echo [2/3] Vérification de ffmpeg...
+echo [2/4] Vérification de ffmpeg...
 ffmpeg -version >nul 2>&1
 if %errorlevel% neq 0 (
     echo ❌ ffmpeg non trouvé!
@@ -42,18 +42,23 @@ echo ✓ ffmpeg trouvé
 
 :: Installer packages Python
 echo.
-echo [3/3] Installation des packages Python...
-echo Cela peut prendre quelques minutes...
-echo.
-
+echo [3/4] Installation des packages Python...
 pip install customtkinter tkinterdnd2 pillow opencv-python numpy
 
-if %errorlevel% neq 0 (
-    echo.
-    echo ❌ Erreur lors de l'installation des packages!
-    echo.
-    pause
-    exit /b 1
+:: PyTorch optionnel
+echo.
+echo [4/4] PyTorch GPU (optionnel)
+echo Voulez-vous installer PyTorch CUDA pour accélération GPU?
+echo (Recommandé si vous avez une NVIDIA GPU)
+echo.
+set /p install_torch="Installer PyTorch? (y/n): "
+
+if /i "%install_torch%"=="y" (
+    echo Installation de PyTorch CUDA...
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+    echo ✓ PyTorch CUDA installé
+) else (
+    echo PyTorch non installé. SuturaCappella fonctionnera en CPU.
 )
 
 echo.
