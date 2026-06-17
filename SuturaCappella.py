@@ -53,12 +53,13 @@ def parse_detx(path):
                 elif typ == "mpb":
                     # Marqueur labial - créer un segment pour le texte accumulé
                     if current_text and current_start is not None:
-                        text_content = " ".join(current_text).strip()
-                        if text_content:  # Ne pas créer de segment vide
+                        text_content = " ".join(current_text)
+                        # Garder même si c'est juste des espaces (pauses)
+                        if text_content.strip() or text_content:
                             segments.append({
                                 "start": current_start,
                                 "end": t,
-                                "text": text_content,
+                                "text": text_content.strip() if text_content.strip() else " ",
                                 "track": track,
                                 "color": color
                             })
@@ -68,12 +69,12 @@ def parse_detx(path):
                 elif typ == "out_open" and start is not None:
                     # Fin de la ligne - créer un segment pour le texte restant
                     if current_text:
-                        text_content = " ".join(current_text).strip()
-                        if text_content:
+                        text_content = " ".join(current_text)
+                        if text_content.strip() or text_content:
                             segments.append({
                                 "start": current_start,
                                 "end": t,
-                                "text": text_content,
+                                "text": text_content.strip() if text_content.strip() else " ",
                                 "track": track,
                                 "color": color
                             })
@@ -82,7 +83,8 @@ def parse_detx(path):
                     current_start = None
 
             elif child.tag == "text":
-                txt = (child.text or "").strip()
+                txt = child.text or ""
+                # Garder le texte tel quel (avec les espaces)
                 if txt:
                     current_text.append(txt)
 
@@ -133,7 +135,7 @@ def stretch_text(draw_img, text, x_pos, width_px, color, y):
     draw_img.alpha_composite(text_img,(x_pos,y))
 
 def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps):
-    # Background jaune doux
+    # Background jaune doux (Changez les nombres pour changer la vouleur (R,G,B,A))
     img = Image.new("RGBA",(export_w, rhythmo_h),(245,235,180,255))
     d = ImageDraw.Draw(img)
 
@@ -195,7 +197,7 @@ class App:
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
         # Titre
-        title = ctk.CTkLabel(main_frame, text="SuturaCappella", font=("Arial", 32, "bold"))
+        title = ctk.CTkLabel(main_frame, text="Cappella → Vidéo", font=("Arial", 32, "bold"))
         title.pack(pady=20)
 
         # 1. DETX
@@ -229,7 +231,7 @@ class App:
         self.video_label.dnd_bind("<<Drop>>", self.drop_video)
 
         # 3. Audio (optionnel)
-        audio_label = ctk.CTkLabel(main_frame, text="3. Audio (MP3, WAV, M4A) - Optionnel", font=("Arial", 14, "bold"))
+        audio_label = ctk.CTkLabel(main_frame, text="3. Audio (MP3, WAV, M4A, MP4) - Optionnel", font=("Arial", 14, "bold"))
         audio_label.pack(anchor="w", pady=(15,5))
 
         self.audio_label = ctk.CTkLabel(
@@ -385,7 +387,7 @@ class App:
             self.status.configure(text="Intégration du son...", text_color="#ffffff")
             self.root.update()
 
-            # Intégration audio avec ffmpeg (OPTIMISÉ)
+            # Intégration audio avec ffmpeg
             if self.integrate_audio_ffmpeg(tmp, out, self.audio, duration):
                 self.status.configure(text="✓ Vidéo créée avec succès!", text_color="#4ade80")
             else:
@@ -413,7 +415,6 @@ class App:
                     output
                 ]
             else:
-                # Sans audio, juste copier
                 cmd = [
                     "ffmpeg",
                     "-i", video_tmp,
