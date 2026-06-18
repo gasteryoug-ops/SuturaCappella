@@ -10,7 +10,7 @@ TRACKS = 4
 PPS = 200  # Pixels par seconde pour la bande rythmo
 
 # Couleur en RGB du background de la bande rythmo
-COLOR = (184,245,180,255)
+COLOR = (235,235,235,255)
 
 # Framerate et résolution options
 FRAMERATES = [24, 30, 60, 120]
@@ -112,7 +112,18 @@ def fit_frame(frame, export_w, export_h):
     canvas[y:y+nh, x:x+nw] = resized
     return canvas
 
-def stretch_text(draw_img, text, x_pos, width_px, color, y):
+def stretch_text(draw_img, text, x_pos, width_px, color, y, line_height):
+    """Dessiner le texte centré verticalement dans sa ligne
+    
+    Args:
+        draw_img: Image PIL à dessiner dessus
+        text: Texte à afficher
+        x_pos: Position X
+        width_px: Largeur disponible
+        color: Couleur RGB
+        y: Position Y du début de la ligne
+        line_height: Hauteur totale de la ligne
+    """
     if not text:
         return
 
@@ -128,18 +139,23 @@ def stretch_text(draw_img, text, x_pos, width_px, color, y):
     tw = max(1,bbox[2]-bbox[0])
     th = bbox[3]-bbox[1]
 
-    text_img = Image.new("RGBA",(tw+20,th+20),(0,0,0,0))
+    # Créer l'image de texte avec padding minimal
+    text_img = Image.new("RGBA",(tw+10,th+10),(0,0,0,0))
     d2 = ImageDraw.Draw(text_img)
-    d2.text((10,10), text, fill=color, font=font)
+    d2.text((5,5), text, fill=color, font=font)
 
-    width_px = max(width_px, tw)
+    # Redimensionner pour matcher la largeur disponible
     text_img = text_img.resize((width_px, text_img.height))
 
-    draw_img.alpha_composite(text_img,(x_pos,y))
+    # Centrer verticalement dans la ligne
+    text_y = y + (line_height - text_img.height) // 2
+    text_y = max(y, text_y)  # Ne pas dépasser le début de la ligne
+    
+    draw_img.alpha_composite(text_img,(x_pos, text_y))
 
-def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps):
-    # Background modifiable dans la variable "COLOR"
-    img = Image.new("RGBA",(export_w, rhythmo_h),(COLOR))
+def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color):
+    # Background personnalisable via paramètre
+    img = Image.new("RGBA",(export_w, rhythmo_h),color)
     d = ImageDraw.Draw(img)
 
     th = rhythmo_h // tracks
@@ -163,7 +179,8 @@ def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps):
         if x2 < -2000 or x1 > export_w+2000:
             continue
 
-        width = max(50, x2-x1)
+        # Largeur minimum augmentée pour éviter overlap du texte
+        width = max(150, x2-x1)
 
         stretch_text(
             img,
@@ -171,7 +188,8 @@ def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps):
             x1,
             width,
             hex2rgb(seg["color"]),
-            track*th+10
+            track*th,
+            th
         )
 
     return cv2.cvtColor(np.array(img.convert("RGB")),cv2.COLOR_RGB2BGR)
@@ -182,6 +200,7 @@ class App:
         self.detx = None
         self.video = None
         self.audio = None
+        self.current_color = (235, 235, 235, 255)  # Couleur RGB du background
 
         # Créer le root EN PREMIER
         self.root = TkinterDnD.Tk()
@@ -296,6 +315,29 @@ class App:
         )
         self.mute_checkbox.pack(anchor="w")
 
+        # Color picker pour la bande rythmo
+        color_frame = ctk.CTkFrame(main_frame)
+        color_frame.pack(fill="x", pady=15)
+
+        color_label = ctk.CTkLabel(color_frame, text="Couleur bande rythmo:", font=("Arial", 12, "bold"))
+        color_label.pack(side="left", padx=(0,10))
+
+        self.color_entry = ctk.CTkEntry(
+            color_frame,
+            placeholder_text="#EBEBEB",
+            width=120
+        )
+        self.color_entry.pack(side="left", padx=(0,10))
+        self.color_entry.insert(0, "#EBEBEB")
+
+        color_apply_btn = ctk.CTkButton(
+            color_frame,
+            text="Appliquer",
+            width=100,
+            command=self.apply_color
+        )
+        color_apply_btn.pack(side="left")
+
         # Framerate
         framerate_frame = ctk.CTkFrame(main_frame)
         framerate_frame.pack(fill="x", pady=15)
@@ -385,6 +427,27 @@ class App:
         self.audio = None
         self.audio_label.configure(text="🔊 Déposez un fichier audio (optionnel)")
 
+    def apply_color(self):
+        """Convertir hex en RGB et appliquer la couleur"""
+        hex_color = self.color_entry.get().strip()
+        
+        if not hex_color.startswith("#"):
+            hex_color = "#" + hex_color
+        
+        try:
+            # Valider et convertir hex en RGB
+            rgb = hex2rgb(hex_color)
+            self.current_color = (rgb[0], rgb[1], rgb[2], 255)
+            self.status.configure(
+                text=f"✓ Couleur appliquée: {hex_color}",
+                text_color="#4ade80"
+            )
+        except:
+            self.status.configure(
+                text="❌ Code couleur invalide (ex: #EBEBEB)",
+                text_color="#ff6b6b"
+            )
+
     def generate(self):
         if not self.detx or not self.video:
             self.status.configure(text="❌ Veuillez déposer DETX et vidéo", text_color="#ff6b6b")
@@ -438,7 +501,7 @@ class App:
                     break
                 
                 frame = fit_frame(frame, export_w, video_h)
-                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS)
+                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS, self.current_color)
 
                 final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
                 final[:video_h] = frame
@@ -480,7 +543,6 @@ class App:
         """Intégrer l'audio avec ffmpeg (ULTRA-RAPIDE)"""
         try:
             mute_enabled = self.mute_audio.get()
-            has_audio = False
 
             if mute_enabled:
                 # Mute - aucun audio dans la sortie
@@ -493,6 +555,13 @@ class App:
                     "-loglevel", "error",
                     output
                 ]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+                if result.returncode != 0:
+                    error_msg = result.stderr if result.stderr else "Erreur ffmpeg inconnue"
+                    print(f"Erreur ffmpeg: {error_msg}")
+                    self.status.configure(text=f"❌ Erreur ffmpeg: {error_msg[:50]}...", text_color="#ff6b6b")
+                    return False
+
             elif audio_file:
                 # Audio externe fourni - l'utiliser
                 cmd = [
@@ -506,32 +575,39 @@ class App:
                     "-loglevel", "error",
                     output
                 ]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+                if result.returncode != 0:
+                    error_msg = result.stderr if result.stderr else "Erreur ffmpeg inconnue"
+                    print(f"Erreur ffmpeg: {error_msg}")
+                    self.status.configure(text=f"❌ Erreur ffmpeg: {error_msg[:50]}...", text_color="#ff6b6b")
+                    return False
+
             else:
-                # Pas d'audio externe - utiliser l'audio de la vidéo source
-                try:
-                    cap = cv2.VideoCapture(self.video)
-                    # Vérifier s'il y a un stream audio
-                    has_audio = int(cap.get(cv2.CAP_PROP_AUDIO_STREAM_IDX)) >= 0
-                    cap.release()
-                except:
-                    has_audio = False
+                # Pas d'audio externe - extraire de la vidéo source
+                audio_tmp = tempfile.mktemp(suffix=".aac")
+                extract_cmd = [
+                    "ffmpeg",
+                    "-i", self.video,
+                    "-c:a", "aac",
+                    "-q:a", "9",
+                    "-vn",
+                    "-y",
+                    "-loglevel", "error",
+                    audio_tmp
+                ]
                 
-                if has_audio:
-                    # Extraire audio temporaire de la vidéo source
-                    audio_tmp = tempfile.mktemp(suffix=".aac")
-                    extract_cmd = [
-                        "ffmpeg",
-                        "-i", self.video,
-                        "-c:a", "aac",
-                        "-q:a", "9",
-                        "-vn",
-                        "-y",
-                        "-loglevel", "error",
-                        audio_tmp
-                    ]
-                    subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    
-                    # Combiner vidéo avec audio extrait
+                # Essayer d'extraire l'audio
+                extract_result = subprocess.run(
+                    extract_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False
+                )
+                
+                if extract_result.returncode == 0 and os.path.getsize(audio_tmp) > 1000:
+                    # Audio extraire avec succès - combiner avec la vidéo
+                    print(f"Audio extrait de la vidéo source: {audio_tmp}")
                     cmd = [
                         "ffmpeg",
                         "-i", video_tmp,
@@ -543,13 +619,7 @@ class App:
                         "-loglevel", "error",
                         output
                     ]
-                    result = subprocess.run(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        check=False
-                    )
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
                     
                     try:
                         os.remove(audio_tmp)
@@ -559,16 +629,16 @@ class App:
                     if result.returncode != 0:
                         error_msg = result.stderr if result.stderr else "Erreur ffmpeg inconnue"
                         print(f"Erreur ffmpeg: {error_msg}")
-                        self.status.configure(
-                            text=f"❌ Erreur ffmpeg: {error_msg[:50]}...",
-                            text_color="#ff6b6b"
-                        )
+                        self.status.configure(text=f"❌ Erreur ffmpeg: {error_msg[:50]}...", text_color="#ff6b6b")
                         return False
-                    
-                    print(f"✓ Vidéo finalisée: {output}")
-                    return True
                 else:
-                    # Aucun audio dans la vidéo source - vidéo sans son
+                    # Pas d'audio trouvé - vidéo sans son
+                    print("Aucun audio détecté dans la vidéo source")
+                    try:
+                        os.remove(audio_tmp)
+                    except:
+                        pass
+                    
                     cmd = [
                         "ffmpeg",
                         "-i", video_tmp,
@@ -578,24 +648,12 @@ class App:
                         "-loglevel", "error",
                         output
                     ]
-
-            # Exécuter ffmpeg pour les autres cas
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False
-            )
-
-            if result.returncode != 0:
-                error_msg = result.stderr if result.stderr else "Erreur ffmpeg inconnue"
-                print(f"Erreur ffmpeg: {error_msg}")
-                self.status.configure(
-                    text=f"❌ Erreur ffmpeg: {error_msg[:50]}...",
-                    text_color="#ff6b6b"
-                )
-                return False
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+                    if result.returncode != 0:
+                        error_msg = result.stderr if result.stderr else "Erreur ffmpeg inconnue"
+                        print(f"Erreur ffmpeg: {error_msg}")
+                        self.status.configure(text=f"❌ Erreur ffmpeg: {error_msg[:50]}...", text_color="#ff6b6b")
+                        return False
 
             print(f"✓ Vidéo finalisée: {output}")
             return True
