@@ -30,18 +30,23 @@ def parse_detx(path):
 
     roles = {}
     for role in root.findall("./roles/role"):
-        roles[role.attrib["id"]] = role.attrib.get("color","#FFFFFF")
+        roles[role.attrib["id"]] = {
+            "color": role.attrib.get("color","#FFFFFF"),
+            "name": role.attrib.get("name", "Unknown")
+        }
 
     segments = []
 
     for line in root.findall("./body/line"):
         track = int(line.attrib.get("track",0))
         role = line.attrib.get("role","")
-        color = roles.get(role,"#FFFFFF")
+        color = roles.get(role, {}).get("color", "#FFFFFF")
+        role_name = roles.get(role, {}).get("name", "Unknown")
 
         start = None
         current_text = []
         current_start = None
+        phrase_started = False
 
         for child in line:
             if child.tag == "lipsync":
@@ -52,6 +57,7 @@ def parse_detx(path):
                     start = t
                     current_start = t
                     current_text = []
+                    phrase_started = False  # Réinitialiser pour chaque phrase
 
                 elif typ == "mpb":
                     # Marqueur labial - créer un segment pour le texte accumulé
@@ -64,8 +70,11 @@ def parse_detx(path):
                                 "end": t,
                                 "text": text_content.strip() if text_content.strip() else " ",
                                 "track": track,
-                                "color": color
+                                "color": color,
+                                "role_name": role_name,
+                                "is_phrase_start": not phrase_started  # True seulement pour le premier
                             })
+                            phrase_started = True  # Marquer qu'on a créé au moins un segment
                         current_start = t
                         current_text = []
 
@@ -79,11 +88,14 @@ def parse_detx(path):
                                 "end": t,
                                 "text": text_content.strip() if text_content.strip() else " ",
                                 "track": track,
-                                "color": color
+                                "color": color,
+                                "role_name": role_name,
+                                "is_phrase_start": not phrase_started  # True seulement pour le premier
                             })
                     start = None
                     current_text = []
                     current_start = None
+                    phrase_started = False
 
             elif child.tag == "text":
                 txt = child.text or ""
@@ -153,10 +165,17 @@ def stretch_text(draw_img, text, x_pos, width_px, color, y, line_height):
     
     draw_img.alpha_composite(text_img,(x_pos, text_y))
 
-def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color):
-    # Background personnalisable via paramètre
-    img = Image.new("RGBA",(export_w, rhythmo_h),color)
-    d = ImageDraw.Draw(img)
+def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color, show_names):
+    # Ajouter padding en haut pour overflow des noms
+    name_padding = 40 if show_names else 0
+    total_height = rhythmo_h + name_padding
+    
+    # Background personnalisable via paramètre (sans le padding)
+    img = Image.new("RGBA", (export_w, total_height), (255, 255, 255, 0))
+    
+    # Créer la bande rythmo dans la partie basse
+    rhythmo_img = Image.new("RGBA", (export_w, rhythmo_h), color)
+    d = ImageDraw.Draw(rhythmo_img)
 
     th = rhythmo_h // tracks
 
@@ -169,6 +188,9 @@ def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color)
     center = 150
     d.line((center,0,center,rhythmo_h),fill=(255,0,0),width=3)
 
+    # Calculer les positions des noms pour détecter les chevauchements
+    name_positions = []
+    
     # Dessiner les segments de dialogue
     for seg in segments:
         track = min(seg["track"], tracks-1)
@@ -183,7 +205,7 @@ def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color)
         width = max(150, x2-x1)
 
         stretch_text(
-            img,
+            rhythmo_img,
             seg["text"],
             x1,
             width,
@@ -191,8 +213,84 @@ def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color)
             track*th,
             th
         )
+        
+        # Stocker la position du nom pour vérifier les chevauchements
+        if show_names:
+            name_positions.append({
+                "name": seg.get("role_name", "Unknown"),
+                "track": track,
+                "x1": x1,
+                "x2": x2,
+                "y": track*th,
+                "color": hex2rgb(seg["color"]),
+                "is_phrase_start": seg.get("is_phrase_start", False)
+            })
 
-    return cv2.cvtColor(np.array(img.convert("RGB")),cv2.COLOR_RGB2BGR)
+    # Coller la bande rythmo dans la partie basse de l'image finale
+    img.alpha_composite(rhythmo_img, (0, name_padding))
+
+    # Afficher les noms des rôles si activé
+    if show_names:
+        try:
+            name_font = ImageFont.truetype("arial.ttf", 20)
+        except:
+            name_font = ImageFont.load_default()
+        
+        name_height = int(th * 0.4)  # 40% de la hauteur de la ligne
+        
+        # Vérifier les chevauchements et déterminer l'opacité
+        for i, pos in enumerate(name_positions):
+            # Afficher le nom seulement au début de la phrase
+            if not pos["is_phrase_start"]:
+                continue
+            
+            opacity = 255  # Opacité par défaut
+            
+            # Vérifier si ce nom chevauche d'autres
+            for j, other_pos in enumerate(name_positions):
+                if i != j and pos["track"] == other_pos["track"] and other_pos["is_phrase_start"]:
+                    # Même piste et autres débuts de phrase - vérifier chevauchement X
+                    if (pos["x1"] < other_pos["x2"] and pos["x2"] > other_pos["x1"]):
+                        # Chevauchement détecté
+                        opacity = 128  # 50% transparence
+                        break
+            
+            # Créer badge du nom avec background coloré
+            name_text = pos["name"]
+            name_draw_temp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            bbox = name_draw_temp.textbbox((0, 0), name_text, font=name_font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            
+            # Padding autour du texte
+            padding_x = 8
+            name_width = text_width + padding_x * 2
+            
+            # Créer le badge avec background coloré
+            name_img = Image.new("RGBA", (name_width, name_height), pos["color"])
+            name_draw_img = ImageDraw.Draw(name_img)
+            
+            # Centrer le texte verticalement dans le badge
+            text_y = (name_height - text_height) // 2
+            name_draw_img.text((padding_x, text_y), name_text, fill=(255, 255, 255), font=name_font)
+            
+            # Appliquer l'opacité
+            if opacity < 255:
+                alpha = name_img.split()[3]
+                alpha = alpha.point(lambda p: int(p * opacity / 255))
+                name_img.putalpha(alpha)
+            
+            # Placer le nom à gauche du texte, haut touchant la ligne de séparation
+            name_x = pos["x1"] - name_width
+            name_y = pos["y"] + name_padding  # Ajuster pour le padding
+            
+            # Dessiner sur l'image finale avec padding
+            img.alpha_composite(name_img, (name_x, name_y))
+
+    # Recadrer pour retourner seulement la bande rythmo (sans le padding)
+    result_img = img.crop((0, name_padding, export_w, total_height))
+    
+    return cv2.cvtColor(np.array(result_img.convert("RGB")),cv2.COLOR_RGB2BGR)
 
 class App:
 
@@ -314,6 +412,18 @@ class App:
             variable=self.mute_audio
         )
         self.mute_checkbox.pack(anchor="w")
+
+        # Checkbox Afficher les noms
+        names_frame = ctk.CTkFrame(main_frame)
+        names_frame.pack(fill="x", pady=10)
+
+        self.show_names = ctk.BooleanVar(value=True)
+        self.names_checkbox = ctk.CTkCheckBox(
+            names_frame,
+            text="👤 Afficher les noms des rôles",
+            variable=self.show_names
+        )
+        self.names_checkbox.pack(anchor="w")
 
         # Color picker pour la bande rythmo
         color_frame = ctk.CTkFrame(main_frame)
@@ -501,7 +611,7 @@ class App:
                     break
                 
                 frame = fit_frame(frame, export_w, video_h)
-                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS, self.current_color)
+                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS, self.current_color, self.show_names.get())
 
                 final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
                 final[:video_h] = frame
