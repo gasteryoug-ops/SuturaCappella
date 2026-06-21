@@ -1,4 +1,6 @@
 import os, time, threading, tempfile, xml.etree.ElementTree as ET, subprocess
+from queue import Queue, Empty
+from collections import OrderedDict
 import cv2, numpy as np
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
@@ -7,12 +9,10 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 
 DETX_FPS = 25
 TRACKS = 4
-PPS = 200  # Pixels par seconde pour la bande rythmo
+PPS = 200
 
-# Couleur en RGB du background de la bande rythmo
 COLOR = (235,235,235,255)
 
-# Framerate et résolution options
 FRAMERATES = [24, 30, 60, 120]
 RESOLUTIONS = {
     "720p": (1280, 720),
@@ -21,17 +21,47 @@ RESOLUTIONS = {
     "4K": (3840, 2160)
 }
 
+# Cache global avec limite LRU
+_FONT_CACHE = {}
+_TEXT_IMG_CACHE_SIZE = 0
+_TEXT_IMG_CACHE = OrderedDict()  # LRU cache
+_NAME_BADGE_CACHE_SIZE = 0
+_NAME_BADGE_CACHE = OrderedDict()  # LRU cache
+
+MAX_TEXT_CACHE_SIZE = 500 * 1024 * 1024  # 500MB max pour images texte
+MAX_BADGE_CACHE_SIZE = 100 * 1024 * 1024  # 100MB max pour badges
+
+def get_font(font_name, size):
+    """Cache global des fonts"""
+    cache_key = (font_name, size)
+    if cache_key not in _FONT_CACHE:
+        try:
+            _FONT_CACHE[cache_key] = ImageFont.truetype(font_name, size)
+        except:
+            _FONT_CACHE[cache_key] = ImageFont.load_default()
+    return _FONT_CACHE[cache_key]
+
 def tc_to_seconds(tc):
     h,m,s,f = map(int, tc.split(":"))
-    return h*3600+m*60+s+f/DETX_FPS-3600
+    result = h*3600+m*60+s+f/DETX_FPS-3600
+    # Afficher la première et quelques timecodes pour diagnostic
+    # (Non affiché à chaque appel pour ne pas flood le console)
+    return result
+
+def hex2rgb(h):
+    """Hex to RGB"""
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2],16) for i in (0,2,4))
 
 def parse_detx(path):
+    """Parse DETX avec pré-conversion couleurs"""
     root = ET.parse(path).getroot()
 
     roles = {}
     for role in root.findall("./roles/role"):
+        color_hex = role.attrib.get("color","#FFFFFF")
         roles[role.attrib["id"]] = {
-            "color": role.attrib.get("color","#FFFFFF"),
+            "color": hex2rgb(color_hex),
             "name": role.attrib.get("name", "Unknown")
         }
 
@@ -40,7 +70,7 @@ def parse_detx(path):
     for line in root.findall("./body/line"):
         track = int(line.attrib.get("track",0))
         role = line.attrib.get("role","")
-        color = roles.get(role, {}).get("color", "#FFFFFF")
+        color = roles.get(role, {}).get("color", (255, 255, 255))
         role_name = roles.get(role, {}).get("name", "Unknown")
 
         start = None
@@ -57,13 +87,11 @@ def parse_detx(path):
                     start = t
                     current_start = t
                     current_text = []
-                    phrase_started = False  # Réinitialiser pour chaque phrase
+                    phrase_started = False
 
                 elif typ == "mpb":
-                    # Marqueur labial - créer un segment pour le texte accumulé
                     if current_text and current_start is not None:
-                        text_content = " ".join(current_text)
-                        # Garder même si c'est juste des espaces (pauses)
+                        text_content = "".join(current_text)
                         if text_content.strip() or text_content:
                             segments.append({
                                 "start": current_start,
@@ -72,16 +100,15 @@ def parse_detx(path):
                                 "track": track,
                                 "color": color,
                                 "role_name": role_name,
-                                "is_phrase_start": not phrase_started  # True seulement pour le premier
+                                "is_phrase_start": not phrase_started
                             })
-                            phrase_started = True  # Marquer qu'on a créé au moins un segment
+                            phrase_started = True
                         current_start = t
                         current_text = []
 
                 elif typ == "out_open" and start is not None:
-                    # Fin de la ligne - créer un segment pour le texte restant
                     if current_text:
-                        text_content = " ".join(current_text)
+                        text_content = "".join(current_text)
                         if text_content.strip() or text_content:
                             segments.append({
                                 "start": current_start,
@@ -90,7 +117,7 @@ def parse_detx(path):
                                 "track": track,
                                 "color": color,
                                 "role_name": role_name,
-                                "is_phrase_start": not phrase_started  # True seulement pour le premier
+                                "is_phrase_start": not phrase_started
                             })
                     start = None
                     current_text = []
@@ -99,198 +126,301 @@ def parse_detx(path):
 
             elif child.tag == "text":
                 txt = child.text or ""
-                # Garder le texte tel quel (avec les espaces)
                 if txt:
                     current_text.append(txt)
 
     return segments
 
-def hex2rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2],16) for i in (0,2,4))
-
-def fit_frame(frame, export_w, export_h):
+def fit_frame(frame, export_w, export_h, canvas_buffer):
+    """Resize avec buffer réutilisé"""
     h, w = frame.shape[:2]
     scale = min(export_w/w, export_h/h)
     nw, nh = int(w*scale), int(h*scale)
 
     resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    canvas = np.zeros((export_h, export_w, 3), dtype=np.uint8)
-
+    canvas_buffer.fill(0)
     x = (export_w-nw)//2
     y = (export_h-nh)//2
+    canvas_buffer[y:y+nh, x:x+nw] = resized
+    return canvas_buffer
 
-    canvas[y:y+nh, x:x+nw] = resized
-    return canvas
-
-def stretch_text(draw_img, text, x_pos, width_px, color, y, line_height):
-    """Dessiner le texte centré verticalement dans sa ligne
+def get_text_img_cached(text, color, width_px, line_height):
+    """Cache LRU des images texte avec éviction automatique"""
+    global _TEXT_IMG_CACHE_SIZE
     
-    Args:
-        draw_img: Image PIL à dessiner dessus
-        text: Texte à afficher
-        x_pos: Position X
-        width_px: Largeur disponible
-        color: Couleur RGB
-        y: Position Y du début de la ligne
-        line_height: Hauteur totale de la ligne
-    """
-    if not text:
-        return
+    cache_key = (text, color, width_px, line_height)
+    
+    if cache_key in _TEXT_IMG_CACHE:
+        # Déplacer au bout (LRU)
+        _TEXT_IMG_CACHE.move_to_end(cache_key)
+        return _TEXT_IMG_CACHE[cache_key]
 
-    try:
-        font = ImageFont.truetype("arial.ttf", 34)
-    except:
-        font = ImageFont.load_default()
+    font_size = 34
+    font = None
+    
+    while font_size > 8:
+        font = get_font("arial.ttf", font_size)
+        tmp = Image.new("RGBA", (4000, 100), (0, 0, 0, 0))
+        d_tmp = ImageDraw.Draw(tmp)
+        bbox = d_tmp.textbbox((0, 0), text, font=font)
+        tw = max(1, bbox[2] - bbox[0])
+        
+        if tw <= width_px:
+            break
+        font_size -= 2
 
-    tmp = Image.new("RGBA",(4000,100),(0,0,0,0))
+    if font is None:
+        font = get_font("arial.ttf", 8)
+
+    # Créer image texte
+    tmp = Image.new("RGBA", (4000, 100), (0, 0, 0, 0))
     d = ImageDraw.Draw(tmp)
-    bbox = d.textbbox((0,0), text, font=font)
-
-    tw = max(1,bbox[2]-bbox[0])
-    th = bbox[3]-bbox[1]
-
-    # Créer l'image de texte avec padding minimal
-    text_img = Image.new("RGBA",(tw+10,th+10),(0,0,0,0))
-    d2 = ImageDraw.Draw(text_img)
-    d2.text((5,5), text, fill=color, font=font)
-
-    # Redimensionner pour matcher la largeur disponible
-    text_img = text_img.resize((width_px, text_img.height))
-
-    # Centrer verticalement dans la ligne
-    text_y = y + (line_height - text_img.height) // 2
-    text_y = max(y, text_y)  # Ne pas dépasser le début de la ligne
+    bbox = d.textbbox((0, 0), text, font=font)
+    tw = max(1, bbox[2] - bbox[0])
+    th = bbox[3] - bbox[1]
     
-    draw_img.alpha_composite(text_img,(x_pos, text_y))
+    text_img = Image.new("RGBA", (tw + 10, th + 10), (0, 0, 0, 0))
+    d2 = ImageDraw.Draw(text_img)
+    d2.text((5, 5), text, fill=color, font=font)
+    
+    text_img = text_img.resize((width_px, text_img.height), Image.Resampling.LANCZOS)
+    text_img = text_img.resize((width_px, line_height), Image.Resampling.LANCZOS)
+    
+    # Ajouter au cache LRU
+    img_size = text_img.size[0] * text_img.size[1] * 4  # RGBA
+    _TEXT_IMG_CACHE[cache_key] = text_img
+    _TEXT_IMG_CACHE_SIZE += img_size
+    _TEXT_IMG_CACHE.move_to_end(cache_key)
+    
+    # Éviction LRU si dépassement
+    while _TEXT_IMG_CACHE_SIZE > MAX_TEXT_CACHE_SIZE and _TEXT_IMG_CACHE:
+        old_key, old_img = _TEXT_IMG_CACHE.popitem(last=False)
+        _TEXT_IMG_CACHE_SIZE -= old_img.size[0] * old_img.size[1] * 4
+    
+    return text_img
 
-def make_rhythmo(segments, t, export_w, export_h, rhythmo_h, tracks, pps, color, show_names):
-    # Ajouter padding en haut pour overflow des noms
+def make_rhythmo_frame(visible_segments, name_positions, export_w, rhythmo_h, show_names, th, center, color, tracks):
+    """Génère la bande rythmo"""
     name_padding = 40 if show_names else 0
     total_height = rhythmo_h + name_padding
     
-    # Background personnalisable via paramètre (sans le padding)
     img = Image.new("RGBA", (export_w, total_height), (255, 255, 255, 0))
-    
-    # Créer la bande rythmo dans la partie basse
     rhythmo_img = Image.new("RGBA", (export_w, rhythmo_h), color)
     d = ImageDraw.Draw(rhythmo_img)
 
-    th = rhythmo_h // tracks
-
-    # Lignes de séparation entre pistes
+    # Lignes et playhead
     for i in range(tracks+1):
         y = i*th
         d.line((0,y,export_w,y),fill=(140,140,140))
-
-    # Playhead rouge à gauche
-    center = 150
     d.line((center,0,center,rhythmo_h),fill=(255,0,0),width=3)
 
-    # Calculer les positions des noms pour détecter les chevauchements
-    name_positions = []
+    # Dessiner segments texte avec cache
+    for seg in visible_segments:
+        text_img = get_text_img_cached(seg["text"], seg["color"], seg["width"], th)
+        text_y = seg["y_offset"] + (th - text_img.height) // 2
+        rhythmo_img.alpha_composite(text_img, (seg["x1"], text_y))
+
+    img.alpha_composite(rhythmo_img, (0, name_padding))
+
+    # Noms avec cache LRU
+    if show_names and name_positions:
+        name_font = get_font("arial.ttf", 20)
+        name_height = int(th * 0.4)
+        phrase_starts = [pos for pos in name_positions if pos["is_phrase_start"]]
+        
+        for pos in phrase_starts:
+            opacity = 255
+            
+            for other_pos in phrase_starts:
+                if pos is not other_pos and pos["track"] == other_pos["track"]:
+                    if (pos["x1"] < other_pos["x2"] and pos["x2"] > other_pos["x1"]):
+                        opacity = 128
+                        break
+            
+            name_text = pos["name"]
+            badge_cache_key = (name_text, pos["color"], name_height, opacity)
+            
+            if badge_cache_key not in _NAME_BADGE_CACHE:
+                name_draw_temp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+                bbox = name_draw_temp.textbbox((0, 0), name_text, font=name_font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+                
+                padding_x = 8
+                name_width = text_width + padding_x * 2
+                
+                name_img = Image.new("RGBA", (name_width, name_height), pos["color"])
+                name_draw_img = ImageDraw.Draw(name_img)
+                text_y = (name_height - text_height) // 2
+                name_draw_img.text((padding_x, text_y), name_text, fill=(255, 255, 255), font=name_font)
+                
+                if opacity < 255:
+                    alpha = name_img.split()[3]
+                    alpha = alpha.point(lambda p: int(p * opacity / 255))
+                    name_img.putalpha(alpha)
+                
+                _NAME_BADGE_CACHE[badge_cache_key] = name_img
+                _NAME_BADGE_CACHE.move_to_end(badge_cache_key)
+            
+            name_img = _NAME_BADGE_CACHE[badge_cache_key]
+            name_x = pos["x1"] - name_img.width
+            name_y = pos["y"] + name_padding
+            img.alpha_composite(name_img, (name_x, name_y))
+
+    result_img = img.crop((0, name_padding, export_w, total_height))
+    return cv2.cvtColor(np.array(result_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+def precompute_visible_segments(segments, t, export_w, rhythmo_h, pps, tracks, center, th):
+    """Pré-calcule les segments visibles"""
+    visible = []
+    name_pos = []
     
-    # Dessiner les segments de dialogue
     for seg in segments:
         track = min(seg["track"], tracks-1)
-
         x1 = center + int((seg["start"]-t)*pps)
         x2 = center + int((seg["end"]-t)*pps)
 
         if x2 < -2000 or x1 > export_w+2000:
             continue
 
-        # Largeur minimum augmentée pour éviter overlap du texte
-        width = max(150, x2-x1)
-
-        stretch_text(
-            rhythmo_img,
-            seg["text"],
-            x1,
-            width,
-            hex2rgb(seg["color"]),
-            track*th,
-            th
-        )
+        width = max(50, x2-x1)
         
-        # Stocker la position du nom pour vérifier les chevauchements
-        if show_names:
-            name_positions.append({
-                "name": seg.get("role_name", "Unknown"),
-                "track": track,
-                "x1": x1,
-                "x2": x2,
-                "y": track*th,
-                "color": hex2rgb(seg["color"]),
-                "is_phrase_start": seg.get("is_phrase_start", False)
-            })
-
-    # Coller la bande rythmo dans la partie basse de l'image finale
-    img.alpha_composite(rhythmo_img, (0, name_padding))
-
-    # Afficher les noms des rôles si activé
-    if show_names:
-        try:
-            name_font = ImageFont.truetype("arial.ttf", 20)
-        except:
-            name_font = ImageFont.load_default()
+        visible.append({
+            "text": seg["text"],
+            "x1": x1,
+            "width": width,
+            "color": seg["color"],
+            "track": track,
+            "y_offset": track*th
+        })
         
-        name_height = int(th * 0.4)  # 40% de la hauteur de la ligne
-        
-        # Vérifier les chevauchements et déterminer l'opacité
-        for i, pos in enumerate(name_positions):
-            # Afficher le nom seulement au début de la phrase
-            if not pos["is_phrase_start"]:
-                continue
-            
-            opacity = 255  # Opacité par défaut
-            
-            # Vérifier si ce nom chevauche d'autres
-            for j, other_pos in enumerate(name_positions):
-                if i != j and pos["track"] == other_pos["track"] and other_pos["is_phrase_start"]:
-                    # Même piste et autres débuts de phrase - vérifier chevauchement X
-                    if (pos["x1"] < other_pos["x2"] and pos["x2"] > other_pos["x1"]):
-                        # Chevauchement détecté
-                        opacity = 128  # 50% transparence
-                        break
-            
-            # Créer badge du nom avec background coloré
-            name_text = pos["name"]
-            name_draw_temp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-            bbox = name_draw_temp.textbbox((0, 0), name_text, font=name_font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            
-            # Padding autour du texte
-            padding_x = 8
-            name_width = text_width + padding_x * 2
-            
-            # Créer le badge avec background coloré
-            name_img = Image.new("RGBA", (name_width, name_height), pos["color"])
-            name_draw_img = ImageDraw.Draw(name_img)
-            
-            # Centrer le texte verticalement dans le badge
-            text_y = (name_height - text_height) // 2
-            name_draw_img.text((padding_x, text_y), name_text, fill=(255, 255, 255), font=name_font)
-            
-            # Appliquer l'opacité
-            if opacity < 255:
-                alpha = name_img.split()[3]
-                alpha = alpha.point(lambda p: int(p * opacity / 255))
-                name_img.putalpha(alpha)
-            
-            # Placer le nom à gauche du texte, haut touchant la ligne de séparation
-            name_x = pos["x1"] - name_width
-            name_y = pos["y"] + name_padding  # Ajuster pour le padding
-            
-            # Dessiner sur l'image finale avec padding
-            img.alpha_composite(name_img, (name_x, name_y))
-
-    # Recadrer pour retourner seulement la bande rythmo (sans le padding)
-    result_img = img.crop((0, name_padding, export_w, total_height))
+        name_pos.append({
+            "name": seg.get("role_name", "Unknown"),
+            "track": track,
+            "x1": x1,
+            "x2": x2,
+            "y": track*th,
+            "color": seg["color"],
+            "is_phrase_start": seg.get("is_phrase_start", False)
+        })
     
-    return cv2.cvtColor(np.array(result_img.convert("RGB")),cv2.COLOR_RGB2BGR)
+    return visible, name_pos
+
+class FrameReadThread(threading.Thread):
+    """Thread 1: Lecture vidéo séquentielle (sans seek)"""
+    def __init__(self, video_path, total_frames, fps, output_queue, source_fps):
+        threading.Thread.__init__(self)
+        self.video_path = video_path
+        self.total_frames = total_frames
+        self.fps = fps
+        self.output_queue = output_queue
+        self.daemon = False
+        self.running = True
+        self.source_fps = source_fps
+        self.frames_read = 0
+        
+    def run(self):
+        try:
+            cap = cv2.VideoCapture(self.video_path)
+            
+            # Pour chaque frame export, seeker au bon endroit dans la vidéo source
+            for i in range(self.total_frames):
+                if not self.running:
+                    break
+                
+                # Calculer le timecode réel en secondes
+                t = i / self.fps
+                
+                # Convertir en frame source
+                source_frame_number = int(t * self.source_fps)
+                
+                # Seeker à ce frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame_number)
+                
+                ok, frame = cap.read()
+                if not ok:
+                    print(f"[FrameReadThread] Impossible de lire frame source {source_frame_number} (timecode {t:.4f}s)")
+                    break
+                
+                try:
+                    self.output_queue.put((i, frame), timeout=2)
+                    self.frames_read += 1
+                except:
+                    if self.running:
+                        pass
+            
+            cap.release()
+        finally:
+            print(f"[FrameReadThread] Terminé. total_frames demandé={self.total_frames}, frames réellement lues={self.frames_read}")
+            self.output_queue.put(None)  # Signal de fin
+
+class RythmoThread(threading.Thread):
+    """Thread 2: Génération bande rythmo"""
+    def __init__(self, input_queue, output_queue, segments, export_w, export_h, rhythmo_h, fps, current_color, show_names, source_fps):
+        threading.Thread.__init__(self)
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.segments = segments
+        self.export_w = export_w
+        self.export_h = export_h
+        self.rhythmo_h = rhythmo_h
+        self.fps = fps
+        self.source_fps = source_fps
+        self.current_color = current_color
+        self.show_names = show_names
+        self.daemon = False
+        self.running = True
+        self.frames_processed = 0
+        
+    def run(self):
+        try:
+            th = self.rhythmo_h // TRACKS
+            center = 150
+            first_frame_logged = False
+            last_frame_idx = None
+            
+            while self.running:
+                try:
+                    item = self.input_queue.get(timeout=1)
+                    if item is None:
+                        print(f"[RythmoThread] Terminé. frames_processed={self.frames_processed}, dernière frame_idx={last_frame_idx}")
+                        break
+                    
+                    frame_idx, video_frame = item
+                    # Timecode RÉEL à 60 FPS pour fluidité de la bande rythmo
+                    t = frame_idx / self.fps
+                    last_frame_idx = frame_idx
+                    
+                    # LOG : première frame et quelques points de repère
+                    if not first_frame_logged:
+                        print(f"[RythmoThread] PREMIERE FRAME:")
+                        print(f"  frame_idx={frame_idx}, fps_export={self.fps}")
+                        print(f"  t = {frame_idx} / {self.fps} = {t:.6f}s")
+                        first_frame_logged = True
+                    elif frame_idx % 50 == 0:  # Tous les 50 frames
+                        print(f"[RythmoThread] frame_idx={frame_idx}, t={t:.6f}s")
+                    
+                    # Pré-calcul segments visibles
+                    visible_segs, name_pos = precompute_visible_segments(
+                        self.segments, t, self.export_w, self.rhythmo_h, PPS, TRACKS, center, th
+                    )
+                    
+                    # Génération rhythmo
+                    rhythmo = make_rhythmo_frame(
+                        visible_segs, name_pos, self.export_w, self.rhythmo_h,
+                        self.show_names, th, center, self.current_color, TRACKS
+                    )
+                    
+                    self.output_queue.put((frame_idx, video_frame, rhythmo))
+                    self.frames_processed += 1
+                except Empty:
+                    continue
+                except Exception as e:
+                    print(f"Erreur RythmoThread: {e}")
+                    break
+        finally:
+            self.output_queue.put(None)  # Signal de fin
 
 class App:
 
@@ -298,9 +428,9 @@ class App:
         self.detx = None
         self.video = None
         self.audio = None
-        self.current_color = (235, 235, 235, 255)  # Couleur RGB du background
+        self.current_color = (235, 235, 235, 255)
+        self.text_cache = {}
 
-        # Créer le root EN PREMIER
         self.root = TkinterDnD.Tk()
         self.root.title("SuturaCappella")
         self.root.geometry("700x900")
@@ -308,16 +438,13 @@ class App:
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         
-        # Options sélectionnées (APRÈS root)
         self.selected_fps = ctk.IntVar(value=60)
         self.selected_resolution = ctk.StringVar(value="1080p")
         self.mute_audio = ctk.BooleanVar(value=False)
 
-        # Main frame
         main_frame = ctk.CTkFrame(self.root)
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # Titre
         title = ctk.CTkLabel(main_frame, text="SuturaCappella", font=("Arial", 32, "bold"))
         title.pack(pady=20)
 
@@ -511,7 +638,6 @@ class App:
         file_path = e.data.strip("{}")
         ext = os.path.splitext(file_path)[1].lower()
         
-        # Extensions vidéo à bloquer
         video_exts = ['.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.m4v']
         
         if ext in video_exts:
@@ -538,14 +664,12 @@ class App:
         self.audio_label.configure(text="🔊 Déposez un fichier audio (optionnel)")
 
     def apply_color(self):
-        """Convertir hex en RGB et appliquer la couleur"""
         hex_color = self.color_entry.get().strip()
         
         if not hex_color.startswith("#"):
             hex_color = "#" + hex_color
         
         try:
-            # Valider et convertir hex en RGB
             rgb = hex2rgb(hex_color)
             self.current_color = (rgb[0], rgb[1], rgb[2], 255)
             self.status.configure(
@@ -574,11 +698,15 @@ class App:
 
     def render(self, out):
         try:
+            # Vider les caches (mais garder structure LRU)
+            _TEXT_IMG_CACHE.clear()
+            _NAME_BADGE_CACHE.clear()
+            
             fps = self.selected_fps.get()
             res_key = self.selected_resolution.get()
             export_w, export_h = RESOLUTIONS[res_key]
             
-            rhythmo_h = int(export_h * 0.25)  # 25% pour la bande rythmo
+            rhythmo_h = int(export_h * 0.25)
             video_h = export_h - rhythmo_h
 
             segments = parse_detx(self.detx)
@@ -588,9 +716,61 @@ class App:
             total_source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = total_source_frames / source_fps
             total = int(duration * fps)
+            cap.release()
+
+            # ==== LOGS DE DIAGNOSTIC ====
+            print("\n" + "="*60)
+            print("DIAGNOSTIC TIMECODE ET DURÉE")
+            print("="*60)
+            print(f"[VIDEO SOURCE]")
+            print(f"  source_fps = {source_fps}")
+            print(f"  total_source_frames = {total_source_frames}")
+            print(f"  video_duration = {duration:.6f} secondes")
+            print(f"\n[EXPORT]")
+            print(f"  fps_export = {fps}")
+            print(f"  total_frames_a_generer = {total}")
+            print(f"\n[PARAMETRES PASSES AU THREAD]")
+            print(f"  FrameReadThread recevra : total_frames={total}")
+            print(f"  FrameReadThread recevra : fps={fps}")
+            print(f"  FrameReadThread recevra : source_fps={source_fps}")
+            print(f"\n[PROBLEME IDENTIFIE]")
+            print(f"  total_frames != total_source_frames")
+            print(f"  {total} (export) != {total_source_frames} (source)")
+            print(f"  FrameReadThread va boucler {total}x mais source n'a que {total_source_frames} frames")
+            print(f"\n[TIMECODE DANS RHYTHMO]")
+            print(f"  Code : t = frame_idx / fps_export")
+            print(f"  Avec fps_export={fps}")
+            print(f"  Exemple frame 0   : t = 0 / {fps} = 0.000s (CORRECT)")
+            print(f"  Exemple frame 1   : t = 1 / {fps} = {1.0/fps:.6f}s (DEVRAIT ETRE {1.0/source_fps:.6f}s)")
+            print(f"  Exemple frame 100 : t = 100 / {fps} = {100.0/fps:.6f}s (DEVRAIT ETRE {100.0/source_fps:.6f}s)")
+            print(f"  Exemple frame {total_source_frames-1} : t = {total_source_frames-1} / {fps} = {(total_source_frames-1)/fps:.6f}s (DEVRAIT ETRE {(total_source_frames-1)/source_fps:.6f}s)")
+            print(f"\n[PROJECTION]")
+            print(f"  Timecode atteint : ~{total_source_frames/fps:.2f}s (LIMITE)")
+            print(f"  Timecode attendu : ~{duration:.2f}s")
+            print(f"  DUREE VIDEO EXPORT ATTENDUE: {total/fps:.2f} secondes")
+            print(f"  DUREE REELLE SI BUG: ~{total_source_frames/fps:.2f} secondes ({100*total_source_frames/(total if total > 0 else 1):.1f}% seulement)")
+            print("="*60 + "\n")
+            # ==== FIN LOGS ====
+
+            # Pipeline threading avec queues limitées
+            read_queue = Queue(maxsize=3)
+            rhythmo_queue = Queue(maxsize=3)
+
+            # Threads
+            reader = FrameReadThread(self.video, total, fps, read_queue, source_fps)
+            rhythmo_gen = RythmoThread(
+                read_queue, rhythmo_queue, segments, export_w, export_h, 
+                rhythmo_h, fps, self.current_color, self.show_names.get(), source_fps
+            )
+
+            reader.start()
+            rhythmo_gen.start()
+
+            # Buffers réutilisés
+            canvas_buffer = np.zeros((video_h, export_w, 3), dtype=np.uint8)
+            final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
 
             tmp = tempfile.mktemp(suffix=".mp4")
-
             writer = cv2.VideoWriter(
                 tmp,
                 cv2.VideoWriter_fourcc(*"mp4v"),
@@ -599,63 +779,133 @@ class App:
             )
 
             start = time.time()
+            frames_written = 0
+            frame_buffer = {}
+            next_frame_idx = 0
             
-            frame_queue = []
-            
-            for i in range(total):
-                t = i / fps
-
-                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                ok, frame = cap.read()
-                if not ok:
-                    break
+            while frames_written < total:
+                try:
+                    # Timeout augmenté + vérification thread vivant
+                    item = rhythmo_queue.get(timeout=5)
+                    
+                    if item is None:
+                        # Fin du thread rhythmo - vider frame_buffer avant exit
+                        break
+                    
+                    frame_idx, video_frame, rhythmo = item
+                    
+                    # Nettoyer les références anciennes
+                    if len(frame_buffer) > 50:
+                        old_indices = [i for i in frame_buffer.keys() if i < next_frame_idx - 30]
+                        for old_idx in old_indices:
+                            del frame_buffer[old_idx]
+                    
+                    frame_buffer[frame_idx] = (video_frame, rhythmo)
+                    
+                    # Écrire les frames consécutives
+                    while next_frame_idx in frame_buffer:
+                        video_frame, rhythmo = frame_buffer.pop(next_frame_idx)
+                        
+                        video_frame = fit_frame(video_frame, export_w, video_h, canvas_buffer)
+                        
+                        final[:video_h] = video_frame
+                        final[video_h:] = rhythmo
+                        
+                        writer.write(final)
+                        frames_written += 1
+                        next_frame_idx += 1
+                        
+                        # Nettoyer references
+                        del video_frame
+                        del rhythmo
+                        
+                        prog = frames_written / total
+                        self.progress.set(prog)
+                        
+                        elapsed = time.time() - start
+                        fps_actual = frames_written / max(elapsed, 0.01)
+                        eta = (total - frames_written) / max(fps_actual, 0.01)
+                        
+                        self.status.configure(
+                            text=f"{frames_written:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
+                            text_color="#ffffff"
+                        )
+                        self.root.update()
                 
-                frame = fit_frame(frame, export_w, video_h)
-                rh = make_rhythmo(segments, t, export_w, export_h, rhythmo_h, TRACKS, PPS, self.current_color, self.show_names.get())
+                except Empty:
+                    # Timeout - vérifier si threads vivent toujours
+                    if not reader.is_alive() and not rhythmo_gen.is_alive():
+                        break
+                    continue
 
-                final = np.zeros((export_h, export_w, 3), dtype=np.uint8)
-                final[:video_h] = frame
-                final[video_h:] = rh
-
+            # CRUCIAL: Vider frame_buffer résiduel
+            while next_frame_idx in frame_buffer and frames_written < total:
+                video_frame, rhythmo = frame_buffer.pop(next_frame_idx)
+                
+                video_frame = fit_frame(video_frame, export_w, video_h, canvas_buffer)
+                
+                final[:video_h] = video_frame
+                final[video_h:] = rhythmo
+                
                 writer.write(final)
-
-                prog = (i+1)/total
-                self.progress.set(prog)
-
-                elapsed = time.time()-start
-                fps_actual = (i+1)/max(elapsed, 0.01)
-                eta = (total-(i+1))/max(fps_actual, 0.01)
-
-                self.status.configure(
-                    text=f"{i+1:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
-                    text_color="#ffffff"
-                )
-                self.root.update()
+                frames_written += 1
+                next_frame_idx += 1
+                
+                del video_frame
+                del rhythmo
 
             writer.release()
-            cap.release()
+            
+            # Attendre fin threads
+            reader.join(timeout=2)
+            rhythmo_gen.join(timeout=2)
+
+            # ==== LOGS FINAUX ====
+            print("\n" + "="*60)
+            print("RESULTAT FINAL")
+            print("="*60)
+            print(f"[ATTENDU]")
+            print(f"  total_frames à générer = {total}")
+            print(f"  durée attendue = {total/fps:.2f}s (à {fps} FPS)")
+            print(f"\n[REEL]")
+            print(f"  frames_written = {frames_written}")
+            print(f"  durée réelle = {frames_written/fps:.2f}s (à {fps} FPS)")
+            print(f"\n[DIFFERENCE]")
+            print(f"  frames manquantes = {total - frames_written}")
+            print(f"  ratio = {100*frames_written/max(total,1):.1f}% seulement")
+            print(f"  durée perdue = {(total-frames_written)/fps:.2f}s")
+            print(f"\n[ANALYSE]")
+            print(f"  total_source_frames = {total_source_frames}")
+            print(f"  source_fps = {source_fps}")
+            print(f"  total demandé au FrameReadThread = {total}")
+            print(f"  Si FrameReadThread lit seulement {total_source_frames} frames")
+            print(f"  Alors RythmoThread génère {total_source_frames} frames")
+            print(f"  Et writer écrit {total_source_frames} frames")
+            print(f"  Durée = {total_source_frames}/{fps} = {total_source_frames/fps:.2f}s")
+            print(f"  Cela correspond à {100*total_source_frames/max(total,1):.1f}% de la durée attendue")
+            print("="*60 + "\n")
+            # ==== FIN LOGS ====
 
             self.status.configure(text="Intégration du son...", text_color="#ffffff")
             self.root.update()
 
-            # Intégration audio avec ffmpeg (OPTIMISÉ)
             if self.integrate_audio_ffmpeg(tmp, out, self.audio, duration):
                 self.status.configure(text="✓ Vidéo créée avec succès!", text_color="#4ade80")
             else:
-                # integrate_audio_ffmpeg a déjà affiché l'erreur
                 pass
 
         except Exception as e:
             self.status.configure(text=f"❌ Erreur: {str(e)}", text_color="#ff6b6b")
             print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def integrate_audio_ffmpeg(self, video_tmp, output, audio_file, duration):
-        """Intégrer l'audio avec ffmpeg (ULTRA-RAPIDE)"""
+        """Intégrer l'audio avec ffmpeg"""
         try:
             mute_enabled = self.mute_audio.get()
 
             if mute_enabled:
-                # Mute - aucun audio dans la sortie
                 cmd = [
                     "ffmpeg",
                     "-i", video_tmp,
@@ -673,7 +923,6 @@ class App:
                     return False
 
             elif audio_file:
-                # Audio externe fourni - l'utiliser
                 cmd = [
                     "ffmpeg",
                     "-i", video_tmp,
@@ -693,7 +942,6 @@ class App:
                     return False
 
             else:
-                # Pas d'audio externe - extraire de la vidéo source
                 audio_tmp = tempfile.mktemp(suffix=".aac")
                 extract_cmd = [
                     "ffmpeg",
@@ -706,7 +954,6 @@ class App:
                     audio_tmp
                 ]
                 
-                # Essayer d'extraire l'audio
                 extract_result = subprocess.run(
                     extract_cmd,
                     stdout=subprocess.PIPE,
@@ -716,7 +963,6 @@ class App:
                 )
                 
                 if extract_result.returncode == 0 and os.path.getsize(audio_tmp) > 1000:
-                    # Audio extraire avec succès - combiner avec la vidéo
                     print(f"Audio extrait de la vidéo source: {audio_tmp}")
                     cmd = [
                         "ffmpeg",
@@ -742,7 +988,6 @@ class App:
                         self.status.configure(text=f"❌ Erreur ffmpeg: {error_msg[:50]}...", text_color="#ff6b6b")
                         return False
                 else:
-                    # Pas d'audio trouvé - vidéo sans son
                     print("Aucun audio détecté dans la vidéo source")
                     try:
                         os.remove(audio_tmp)
@@ -783,7 +1028,6 @@ class App:
             print(f"Erreur: {e}")
             return False
         finally:
-            # Nettoyer le fichier temporaire
             try:
                 if os.path.exists(video_tmp):
                     os.remove(video_tmp)
