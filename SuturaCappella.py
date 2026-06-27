@@ -182,9 +182,9 @@ def get_text_img_cached(text, color, width_px, line_height):
     
     text_img = Image.new("RGBA", (tw + 10, th + 10), (0, 0, 0, 0))
     d2 = ImageDraw.Draw(text_img)
-    d2.text((5, 5), text, fill=color, font=font)
+    y = 5.0 - bbox[1]
+    d2.text((5, y), text, fill=color, font=font)
     
-    text_img = text_img.resize((width_px, text_img.height), Image.Resampling.LANCZOS)
     text_img = text_img.resize((width_px, line_height), Image.Resampling.LANCZOS)
     
     # Ajouter au cache LRU
@@ -218,8 +218,8 @@ def make_rhythmo_frame(visible_segments, name_positions, export_w, rhythmo_h, sh
     # Dessiner segments texte avec cache
     for seg in visible_segments:
         text_img = get_text_img_cached(seg["text"], seg["color"], seg["width"], th)
-        text_y = seg["y_offset"] + (th - text_img.height) // 2
-        rhythmo_img.alpha_composite(text_img, (seg["x1"], text_y))
+        text_y = seg["y_offset"] + (th - text_img.height) / 2.0
+        rhythmo_img.alpha_composite(text_img, (int(round(seg["x1_float"])), int(round(text_y))))
 
     img.alpha_composite(rhythmo_img, (0, name_padding))
 
@@ -234,7 +234,7 @@ def make_rhythmo_frame(visible_segments, name_positions, export_w, rhythmo_h, sh
             
             for other_pos in phrase_starts:
                 if pos is not other_pos and pos["track"] == other_pos["track"]:
-                    if (pos["x1"] < other_pos["x2"] and pos["x2"] > other_pos["x1"]):
+                    if (pos["x1_float"] < other_pos["x2_float"] and pos["x2_float"] > other_pos["x1_float"]):
                         opacity = 128
                         break
             
@@ -264,7 +264,7 @@ def make_rhythmo_frame(visible_segments, name_positions, export_w, rhythmo_h, sh
                 _NAME_BADGE_CACHE.move_to_end(badge_cache_key)
             
             name_img = _NAME_BADGE_CACHE[badge_cache_key]
-            name_x = pos["x1"] - name_img.width
+            name_x = int(round(pos["x1_float"])) - name_img.width
             name_y = pos["y"] + name_padding
             img.alpha_composite(name_img, (name_x, name_y))
 
@@ -278,17 +278,17 @@ def precompute_visible_segments(segments, t, export_w, rhythmo_h, pps, tracks, c
     
     for seg in segments:
         track = min(seg["track"], tracks-1)
-        x1 = center + int((seg["start"]-t)*pps)
-        x2 = center + int((seg["end"]-t)*pps)
+        x1_float = center + (seg["start"]-t)*pps
+        x2_float = center + (seg["end"]-t)*pps
 
-        if x2 < -2000 or x1 > export_w+2000:
+        if x2_float < -2000 or x1_float > export_w+2000:
             continue
 
-        width = max(50, x2-x1)
+        width = max(50, int(x2_float-x1_float))
         
         visible.append({
             "text": seg["text"],
-            "x1": x1,
+            "x1_float": x1_float,
             "width": width,
             "color": seg["color"],
             "track": track,
@@ -298,8 +298,8 @@ def precompute_visible_segments(segments, t, export_w, rhythmo_h, pps, tracks, c
         name_pos.append({
             "name": seg.get("role_name", "Unknown"),
             "track": track,
-            "x1": x1,
-            "x2": x2,
+            "x1_float": x1_float,
+            "x2_float": x2_float,
             "y": track*th,
             "color": seg["color"],
             "is_phrase_start": seg.get("is_phrase_start", False)
@@ -324,35 +324,40 @@ class FrameReadThread(threading.Thread):
         try:
             cap = cv2.VideoCapture(self.video_path)
             
-            # Pour chaque frame export, seeker au bon endroit dans la vidéo source
-            for i in range(self.total_frames):
-                if not self.running:
+            # OPT#1: Lecture séquentielle avec duplication intelligente
+            # Au lieu de seeker à chaque frame (très lent),
+            # on lit séquentiellement et on duplique intelligemment
+            
+            frame_export_idx = 0
+            source_frame_count = 0
+            
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
                     break
                 
-                # Calculer le timecode réel en secondes
-                t = i / self.fps
+                # Calculer combien de fois dupliquer ce frame
+                # Pour préserver le timing exact
+                next_idx = int(round((source_frame_count + 1) * self.fps / self.source_fps))
+                duplicates = next_idx - frame_export_idx
                 
-                # Convertir en frame source
-                source_frame_number = int(t * self.source_fps)
+                # Envoyer le frame N fois
+                for dup in range(duplicates):
+                    if not self.running:
+                        break
+                    try:
+                        self.output_queue.put((frame_export_idx, frame), timeout=2)
+                        self.frames_read += 1
+                    except:
+                        if self.running:
+                            pass
+                    frame_export_idx += 1
                 
-                # Seeker à ce frame
-                cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame_number)
-                
-                ok, frame = cap.read()
-                if not ok:
-                    print(f"[FrameReadThread] Impossible de lire frame source {source_frame_number} (timecode {t:.4f}s)")
-                    break
-                
-                try:
-                    self.output_queue.put((i, frame), timeout=2)
-                    self.frames_read += 1
-                except:
-                    if self.running:
-                        pass
+                source_frame_count += 1
             
             cap.release()
         finally:
-            print(f"[FrameReadThread] Terminé. total_frames demandé={self.total_frames}, frames réellement lues={self.frames_read}")
+            print(f"[FrameReadThread] Terminé (OPT#1 lecture seq). total_frames={self.total_frames}, frames_read={self.frames_read}")
             self.output_queue.put(None)  # Signal de fin
 
 class RythmoThread(threading.Thread):
@@ -432,7 +437,7 @@ class App:
         self.text_cache = {}
 
         self.root = TkinterDnD.Tk()
-        self.root.title("SuturaCappella")
+        self.root.title("SuturaCappella [EXPERIMENTAL]")
         self.root.geometry("700x900")
         
         ctk.set_appearance_mode("dark")
@@ -445,7 +450,7 @@ class App:
         main_frame = ctk.CTkFrame(self.root)
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        title = ctk.CTkLabel(main_frame, text="SuturaCappella", font=("Arial", 32, "bold"))
+        title = ctk.CTkLabel(main_frame, text="SuturaCappella [EXPERIMENTAL]", font=("Arial", 32, "bold"))
         title.pack(pady=20)
 
         # 1. DETX
@@ -826,11 +831,13 @@ class App:
                         fps_actual = frames_written / max(elapsed, 0.01)
                         eta = (total - frames_written) / max(fps_actual, 0.01)
                         
-                        self.status.configure(
-                            text=f"{frames_written:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
-                            text_color="#ffffff"
-                        )
-                        self.root.update()
+                        # OPT#6: Mettre à jour UI seulement tous les 10 frames pour réduire surcharge
+                        if frames_written % 10 == 0:
+                            self.status.configure(
+                                text=f"{frames_written:,}/{total:,} frames | {fps_actual:.1f} fps | ETA {eta:.0f}s",
+                                text_color="#ffffff"
+                            )
+                            self.root.update()
                 
                 except Empty:
                     # Timeout - vérifier si threads vivent toujours
