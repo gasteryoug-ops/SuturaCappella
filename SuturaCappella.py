@@ -437,7 +437,7 @@ class App:
         self.text_cache = {}
 
         self.root = TkinterDnD.Tk()
-        self.root.title("SuturaCappella [EXPERIMENTAL]")
+        self.root.title("SuturaCappella")
         self.root.geometry("700x900")
         
         ctk.set_appearance_mode("dark")
@@ -450,7 +450,7 @@ class App:
         main_frame = ctk.CTkFrame(self.root)
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        title = ctk.CTkLabel(main_frame, text="SuturaCappella [EXPERIMENTAL]", font=("Arial", 32, "bold"))
+        title = ctk.CTkLabel(main_frame, text="SuturaCappella", font=("Arial", 32, "bold"))
         title.pack(pady=20)
 
         # 1. DETX
